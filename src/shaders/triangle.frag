@@ -1,8 +1,11 @@
 #version 450
 
+layout(rgba32f, binding = 1) uniform image2D img_output;
+
 out vec4 FragColor;
 
 void main() {
-    vec2 coordColor = vec2(gl_FragCoord.x / 1920.0, gl_FragCoord.y / 1080.0);
-    FragColor = vec4(coordColor, 0.2, 1.0);
+    ivec2 pixelCoords = ivec2(gl_FragCoord.xy);
+    vec4 color = imageLoad(img_output, pixelCoords).rgba;
+    FragColor = color;
 }

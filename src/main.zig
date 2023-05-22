@@ -95,8 +95,17 @@ pub fn main() !void {
     const rotationVec = [2]f32{ 0.0, 0.0 };
     try gpu.add_uniform("rotation", @sizeOf(@TypeOf(rotationVec)), &rotationVec);
 
-    // try createStorageBuffer();
-    // try createPixelDrawPipeline();
+    // Creates voxel grid in and voxel grid out
+    try createStorageBuffer();
+
+    // Creates a texture for writing
+    try gpu.add_texture_2d("texture out", @as(i32, config.width), @as(i32, config.height));
+
+    const raycastComp = try shader.Shader.fromPath(shader.ShaderType.Compute, "shaders/raytrace.comp");
+
+    var raytraceShaders = [_]shader.Shader{raycastComp};
+    const raytraceProgram = try shader.ShaderProgram.fromShaders(raytraceShaders[0..]);
+    try gpu.add_shader_program("raytrace", raytraceProgram);
 
     var startTime = glfw.getTime();
     var lastFrameTime = startTime;
@@ -134,7 +143,15 @@ fn render() !void {
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
-    var binds = [_][]const u8{ "vertex", "rotation" };
+    {
+        var binds = [_][]const u8{ "voxel grid in", "texture out" };
+        try gpu.bind_compute("raytrace", binds[0..], null);
+        gl.dispatchCompute(config.width / 8, config.height / 8, 1);
+    }
+
+    gl.memoryBarrier(gl.SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    var binds = [_][]const u8{ "vertex", "rotation", "texture out" };
     try gpu.bind_draw("triangle", binds[0..], "RotationBlock");
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 }
@@ -162,35 +179,35 @@ fn processRotation() [2]f32 {
     return [2]f32{ 0.5 * std.math.sin(rotation), 0.5 * std.math.cos(rotation) };
 }
 
-// const VoxelBufferSize: u32 = 512;
+const VoxelBufferSize: u32 = 16;
 
-// fn createStorageBuffer() !void {
-//     const memory = try allocator.alloc(u32, VoxelBufferSize * VoxelBufferSize * VoxelBufferSize);
-//     defer allocator.free(memory);
+fn createStorageBuffer() !void {
+    const memory = try allocator.alloc(u32, VoxelBufferSize * VoxelBufferSize * VoxelBufferSize);
+    defer allocator.free(memory);
 
-//     // create a sphere as an example
-//     const n = VoxelBufferSize;
-//     const r = (n - 1);
-//     var i: u32 = 0;
-//     while (i < n) : (i += 1) {
-//         var j: u32 = 0;
-//         while (j < n) : (j += 1) {
-//             var k: u32 = 0;
-//             while (k < n) : (k += 1) {
-//                 const index = (i * n * n) + (j * n) + k;
-//                 if (i * i + j * j + k * k <= r * r) {
-//                     memory[index] = 1;
-//                 } else {
-//                     memory[index] = 0;
-//                 }
-//             }
-//         }
-//     }
+    // create a sphere as an example
+    const n = VoxelBufferSize;
+    const r = (n - 1);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        var j: u32 = 0;
+        while (j < n) : (j += 1) {
+            var k: u32 = 0;
+            while (k < n) : (k += 1) {
+                const index = (i * n * n) + (j * n) + k;
+                if (i * i + j * j + k * k <= r * r) {
+                    memory[index] = 1;
+                } else {
+                    memory[index] = 0;
+                }
+            }
+        }
+    }
 
-//     const voxelGridSize = @sizeOf(u32) * @as(isize, @truncate(u32, memory.len));
-//     try gpu.add_storage("voxel grid in", voxelGridSize, memory.ptr);
-//     try gpu.add_storage("voxel grid out", voxelGridSize, memory.ptr);
-// }
+    const voxelGridSize = @sizeOf(u32) * @as(isize, @truncate(u32, memory.len));
+    try gpu.add_storage("voxel grid in", voxelGridSize, memory.ptr);
+    try gpu.add_storage("voxel grid out", voxelGridSize, memory.ptr);
+}
 
 // fn createPixelDrawPipeline() !void {
 //     // Create vertex shader

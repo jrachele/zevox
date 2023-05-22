@@ -192,6 +192,24 @@ pub const GPU = struct {
         try self.bind_buffers(start_index, binds);
     }
 
+    pub fn bind_compute(self: *GPU, program_name: []const u8, binds: [][]const u8, uniform_block: ?[]const u8) !void {
+        var program = self.programs.get(program_name);
+
+        if (program == null) {
+            return GPUError.ProgramNotFound;
+        }
+
+        // If we want our uniforms present we can put them in this block
+        if (uniform_block) |name| {
+            var blockLocation = gl.getUniformBlockIndex(program.?.get(), name.ptr);
+            gl.uniformBlockBinding(program.?.get(), blockLocation, 0);
+        }
+
+        gl.useProgram(program.?.get());
+
+        try self.bind_buffers(0, binds);
+    }
+
     fn bind_buffers(self: *GPU, start_index: u32, buffers: [][]const u8) !void {
         var index = start_index;
         for (buffers) |buffer| {
