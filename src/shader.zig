@@ -1,3 +1,5 @@
+// Shader loader, does not support hot-reloading
+
 const std = @import("std");
 const gl = @import("gl");
 

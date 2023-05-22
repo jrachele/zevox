@@ -39,6 +39,16 @@ fn errorCallback(error_code: glfw.ErrorCode, description: [:0]const u8) void {
     std.log.err("glfw: {}: {s}\n", .{ error_code, description });
 }
 
+export fn glDebugOutput(source: gl.GLenum, output_type: gl.GLenum, id: gl.GLuint, severity: gl.GLenum, length: gl.GLsizei, message: [*:0]const u8, userParam: ?*anyopaque) void {
+    std.debug.print("[OpenGL] {s}\n", .{message});
+    _ = userParam;
+    _ = length;
+    _ = severity;
+    _ = id;
+    _ = output_type;
+    _ = source;
+}
+
 pub fn main() !void {
     glfw.setErrorCallback(errorCallback);
     if (!glfw.init(.{})) {
@@ -52,6 +62,7 @@ pub fn main() !void {
         .opengl_profile = .opengl_core_profile,
         .context_version_major = 4,
         .context_version_minor = 5,
+        .context_debug = true,
     }) orelse {
         std.log.err("failed to create GLFW window: {?s}", .{glfw.getErrorString()});
         std.process.exit(1);
@@ -66,6 +77,11 @@ pub fn main() !void {
     const proc: glfw.GLProc = undefined;
     try gl.load(proc, glGetProcAddress);
 
+    // Setup debug output
+    gl.enable(gl.DEBUG_OUTPUT);
+    gl.enable(gl.DEBUG_OUTPUT_SYNCHRONOUS);
+    gl.debugMessageCallback(&glDebugOutput, null);
+
     const triangleVert = try shader.Shader.fromPath(shader.ShaderType.Vertex, "shaders/triangle.vert");
     const triangleFrag = try shader.Shader.fromPath(shader.ShaderType.Fragment, "shaders/triangle.frag");
 
@@ -75,6 +91,9 @@ pub fn main() !void {
 
     const vertices = [_]f32{ -0.5, -0.5, 0.0, 0.5, -0.5, 0.0, 0.0, 0.5, 0.0 };
     try gpu.add_vertex_buffer("vertex", @sizeOf(@TypeOf(vertices)), &vertices, 3);
+
+    const rotationVec = [2]f32{ 0.0, 0.0 };
+    try gpu.add_uniform("rotation", @sizeOf(@TypeOf(rotationVec)), &rotationVec);
 
     // try createStorageBuffer();
     // try createPixelDrawPipeline();
@@ -93,7 +112,7 @@ pub fn main() !void {
         // heavily below 60 and we need to catch up
         while (time.deltaTime >= 1.0) {
             // Perform physics and input handling here
-            update();
+            try update();
             stats.updates += 1;
             time.deltaTime -= 1;
         }
@@ -105,16 +124,18 @@ pub fn main() !void {
     }
 }
 
-fn update() void {
+fn update() !void {
     processInput();
+
+    try updateUniforms();
 }
 
 fn render() !void {
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
-    var binds = [_][]const u8{"vertex"};
-    try gpu.bind_draw("triangle", binds[0..]);
+    var binds = [_][]const u8{ "vertex", "rotation" };
+    try gpu.bind_draw("triangle", binds[0..], "RotationBlock");
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 }
 
@@ -130,6 +151,11 @@ fn processInput() void {
     if (window.getKey(glfw.Key.right) == glfw.Action.press) {
         rotation += 1.0;
     }
+}
+
+fn updateUniforms() !void {
+    var rotationVec = processRotation();
+    try gpu.update_uniform("rotation", @sizeOf(@TypeOf(rotationVec)), &rotationVec);
 }
 
 fn processRotation() [2]f32 {
