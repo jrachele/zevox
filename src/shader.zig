@@ -26,7 +26,7 @@ pub const Shader = struct {
     pub fn fromRaw(shaderType: ShaderType, comptime raw: []const u8) !Shader {
         var self = Shader{ .shaderType = shaderType, .path = null, .raw = raw, .id = 0 };
 
-        const shaderSource = raw;
+        const shaderSource = raw.ptr;
         var shaderId = gl.createShader(glTypeFromShaderType(shaderType));
         self.id = shaderId;
 
