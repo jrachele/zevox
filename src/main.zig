@@ -87,25 +87,22 @@ pub fn main() !void {
 
     var shaders = [_]shader.Shader{ triangleVert, triangleFrag };
     const triangleProgram = try shader.ShaderProgram.fromShaders(shaders[0..]);
-    try gpu.add_shader_program("triangle", triangleProgram);
+    try gpu.addShaderProgram("triangle", triangleProgram);
 
     const vertices = [_]f32{ -0.5, -0.5, 0.0, 0.5, -0.5, 0.0, 0.0, 0.5, 0.0 };
-    try gpu.add_vertex_buffer("vertex", @sizeOf(@TypeOf(vertices)), &vertices, 3);
-
-    const rotationVec = [2]f32{ 0.0, 0.0 };
-    try gpu.add_uniform("rotation", @sizeOf(@TypeOf(rotationVec)), &rotationVec);
+    try gpu.initVertexBuffer("vertex", @sizeOf(@TypeOf(vertices)), &vertices, 3, 0);
 
     // Creates voxel grid in and voxel grid out
     try createStorageBuffer();
 
     // Creates a texture for writing
-    try gpu.add_texture_2d("texture out", @as(i32, config.width), @as(i32, config.height));
+    try gpu.initTexture2D("texture out", @as(i32, config.width), @as(i32, config.height));
 
     const raycastComp = try shader.Shader.fromPath(shader.ShaderType.Compute, "shaders/raytrace.comp");
 
     var raytraceShaders = [_]shader.Shader{raycastComp};
-    const raytraceProgram = try shader.ShaderProgram.fromShaders(raytraceShaders[0..]);
-    try gpu.add_shader_program("raytrace", raytraceProgram);
+    var raytraceProgram = try shader.ShaderProgram.fromShaders(raytraceShaders[0..]);
+    try gpu.addShaderProgram("raytrace", raytraceProgram);
 
     var startTime = glfw.getTime();
     var lastFrameTime = startTime;
@@ -135,8 +132,6 @@ pub fn main() !void {
 
 fn update() !void {
     processInput();
-
-    try updateUniforms();
 }
 
 fn render() !void {
@@ -144,15 +139,16 @@ fn render() !void {
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     {
-        var binds = [_][]const u8{ "voxel grid in", "texture out" };
-        try gpu.bind_compute("raytrace", binds[0..], null);
+        try gpu.bindStorageBuffer("raytrace", "voxel grid in", 0);
+        try gpu.bindTexture("raytrace", "texture out", 0, 1);
         gl.dispatchCompute(config.width / 8, config.height / 8, 1);
     }
 
     gl.memoryBarrier(gl.SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
-    var binds = [_][]const u8{ "vertex", "rotation", "texture out" };
-    try gpu.bind_draw("triangle", binds[0..], "RotationBlock");
+    try gpu.bindVertices("triangle");
+    try gpu.bindTexture("triangle", "texture out", 0, 1);
+    try gpu.bindUniform("triangle", "rotation", processRotation());
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 }
 
@@ -170,16 +166,11 @@ fn processInput() void {
     }
 }
 
-fn updateUniforms() !void {
-    var rotationVec = processRotation();
-    try gpu.update_uniform("rotation", @sizeOf(@TypeOf(rotationVec)), &rotationVec);
-}
-
 fn processRotation() [2]f32 {
     return [2]f32{ 0.5 * std.math.sin(rotation), 0.5 * std.math.cos(rotation) };
 }
 
-const VoxelBufferSize: u32 = 16;
+const VoxelBufferSize: u32 = 128;
 
 fn createStorageBuffer() !void {
     const memory = try allocator.alloc(u32, VoxelBufferSize * VoxelBufferSize * VoxelBufferSize);
@@ -205,63 +196,6 @@ fn createStorageBuffer() !void {
     }
 
     const voxelGridSize = @sizeOf(u32) * @as(isize, @truncate(u32, memory.len));
-    try gpu.add_storage("voxel grid in", voxelGridSize, memory.ptr);
-    try gpu.add_storage("voxel grid out", voxelGridSize, memory.ptr);
+    try gpu.initStorageBuffer("voxel grid in", voxelGridSize, memory.ptr);
+    try gpu.initStorageBuffer("voxel grid out", voxelGridSize, memory.ptr);
 }
-
-// fn createPixelDrawPipeline() !void {
-//     // Create vertex shader
-//     const vertexShader = try shader.Shader.fromRaw(shader.ShaderType.Vertex,
-//         \\#version 450
-//         \\layout (location = 0) in vec2 position;
-//         \\layout (location = 1) in vec2 texCoord;
-//         \\out vec2 fragTexCoord;
-//         \\void main() {
-//         \\    gl_Position = vec4(position, 0.0, 1.0);
-//         \\    fragTexCoord = texCoord;
-//         \\}
-//     );
-//     defer vertexShader.delete();
-
-//     const fragmentShader = try shader.Shader.fromRaw(shader.ShaderType.Fragment,
-//         \\#version 450
-//         \\in vec2 fragTexCoord;
-//         \\out vec4 fragColor;
-//         \\uniform sampler2D textureBuffer;
-//         \\void main() {
-//         \\    //fragColor = texture(textureBuffer, fragTexCoord);
-//         \\    fragColor = vec4(1.0, 0.0, 0.0, 1.0);
-//         \\}
-//     );
-//     defer fragmentShader.delete();
-
-//     // Create the shader program
-//     var shaders = [_]shader.Shader{ vertexShader, fragmentShader };
-//     pixelDrawPipeline = try shader.ShaderProgram.fromShaders(shaders[0..]);
-//     defer pixelDrawPipeline.delete();
-
-//     // Create and bind vertex buffer
-//     gl.genVertexArrays(1, &VAO);
-//     defer gl.deleteVertexArrays(1, &VAO);
-
-//     gl.genBuffers(1, &VBO);
-//     defer gl.deleteBuffers(1, &VBO);
-
-//     gl.bindVertexArray(VAO);
-
-//     gl.bindBuffer(gl.ARRAY_BUFFER, VBO);
-
-//     const vertices = [_]f32{
-//         // Positions // Texture coordinates
-//         -1.0, 1.0,  0.0, 1.0,
-//         -1.0, -1.0, 0.0, 0.0,
-//         1.0,  -1.0, 1.0, 0.0,
-
-//         -1.0, 1.0,  0.0, 1.0,
-//         1.0,  -1.0, 1.0, 0.0,
-//         1.0,  1.0,  1.0, 1.0,
-//     };
-//     gl.bufferData(gl.ARRAY_BUFFER, @sizeOf(@TypeOf(vertices)), &vertices, gl.STATIC_DRAW);
-//     gl.vertexAttribPointer(0, 12, gl.FLOAT, gl.FALSE, 0, null);
-//     gl.enableVertexAttribArray(0);
-// }
