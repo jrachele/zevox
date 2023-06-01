@@ -1,3 +1,9 @@
-[submodule "libs/mach-glfw"]
-	path = libs/mach-glfw
-	url = https://github.com/hexops/mach-glfw
+[submodule "libs/imgui"]
+	path = libs/imgui
+	url = https://github.com/machlibs/imgui.git
+[submodule "libs/mach"]
+	path = libs/mach
+	url = https://github.com/hexops/mach.git
+[submodule "libs/zmath"]
+	path = libs/zmath
+	url = https://github.com/machlibs/zmath.git

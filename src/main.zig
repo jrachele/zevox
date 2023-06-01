@@ -1,201 +1,280 @@
+const assets = @import("assets");
 const std = @import("std");
-const glfw = @import("glfw");
-const gl = @import("gl");
+const mach = @import("mach");
+const zmath = @import("zmath");
 
-const shader = @import("shader.zig");
-const gameState = @import("gamestate.zig");
-const gpuImport = @import("gpu.zig");
-const log = std.log.scoped(.Engine);
+// local includes
+const input = @import("input.zig");
+const imgui = @import("imgui.zig");
+const ui = @import("ui.zig");
+const voxel = @import("voxel.zig");
+const prelude = @import("prelude.zig");
 
-const Config = struct { width: u32 = 1920, height: u32 = 1080 };
-const config = Config{};
+const Camera = @import("camera.zig").Camera;
+const InputData = input.InputData;
 
-const RunTimeStatistics = struct {
-    updates: u64 = 0,
-    frames: u64 = 0,
+const gpu = mach.gpu;
+pub const App = @This();
+
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+
+const GameConfig = struct {
+    screen_width: u32 = 1920,
+    screen_height: u32 = 1080,
+    voxel_grid_dim: u32 = 256,
+    workgroup_size: u32 = 8,
 };
 
-// Resources
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-const allocator = gpa.allocator();
+const Time = struct {
+    time: f32 = 0.0,
+    delta_time: f32 = 0.0,
+};
 
-// defer gpa.deinit();
+const RaytracingData = extern struct {
+    dim: u32 align(16) = 0,
+    pos: prelude.Vec3 align(16) = [_]f32{ 0.0, 0.0, 0.0 },
+    camera_matrix: prelude.Mat4 align(16),
+    inverse_projection_matrix: prelude.Mat4 align(16),
+};
 
-var gpu: gpuImport.GPU = gpuImport.GPU.init(allocator);
-var window: glfw.Window = undefined;
-var time = gameState.Time{ .time = 0.0, .deltaTime = 0.0, .limitFPS = 1.0 / 60.0 };
-var stats = RunTimeStatistics{};
-
-// Test resources
-var rotation: f32 = 0.0;
-
-fn glGetProcAddress(p: glfw.GLProc, proc: [:0]const u8) ?gl.FunctionPointer {
-    _ = p;
-    return glfw.getProcAddress(proc);
+test "raytracing data size" {
+    try std.testing.expect(@sizeOf(RaytracingData) == 144);
 }
 
-/// Default GLFW error handling callback
-fn errorCallback(error_code: glfw.ErrorCode, description: [:0]const u8) void {
-    std.log.err("glfw: {}: {s}\n", .{ error_code, description });
-}
+core: mach.Core,
+timer: mach.Timer,
+time: Time,
+game_config: GameConfig,
+input_data: InputData,
+camera: Camera,
+raytracing_data: RaytracingData,
+raytracing_data_buffer: *gpu.Buffer,
+raytracing_pipeline: *gpu.ComputePipeline,
+raytracing_bind_group: *gpu.BindGroup,
+render_pipeline: *gpu.RenderPipeline,
+render_bind_group: *gpu.BindGroup,
+queue: *gpu.Queue,
 
-export fn glDebugOutput(source: gl.GLenum, output_type: gl.GLenum, id: gl.GLuint, severity: gl.GLenum, length: gl.GLsizei, message: [*:0]const u8, userParam: ?*anyopaque) void {
-    std.debug.print("[OpenGL] {s}\n", .{message});
-    _ = userParam;
-    _ = length;
-    _ = severity;
-    _ = id;
-    _ = output_type;
-    _ = source;
-}
+pub fn init(app: *App) !void {
+    app.game_config = GameConfig{};
+    app.input_data = InputData{};
+    app.setupCamera();
+    app.timer = try mach.Timer.start();
+    app.time = Time{};
 
-pub fn main() !void {
-    glfw.setErrorCallback(errorCallback);
-    if (!glfw.init(.{})) {
-        std.log.err("failed to initialize GLFW: {?s}", .{glfw.getErrorString()});
-        std.process.exit(1);
-    }
-    defer glfw.terminate();
+    try app.core.init(gpa.allocator(), .{ .title = "Zoxel", .size = .{
+        .width = app.game_config.screen_width,
+        .height = app.game_config.screen_height,
+    } });
 
-    // Create our window
-    window = glfw.Window.create(config.width, config.height, "voxel-zig", null, null, .{
-        .opengl_profile = .opengl_core_profile,
-        .context_version_major = 4,
-        .context_version_minor = 5,
-        .context_debug = true,
-    }) orelse {
-        std.log.err("failed to create GLFW window: {?s}", .{glfw.getErrorString()});
-        std.process.exit(1);
+    // Disable VSync cause I ain't no RAT.
+    app.core.setVSync(.none);
+
+    // Raytracing compute pipeline
+    const raytracing_module = app.core.device().createShaderModuleWGSL("raytrace.wgsl", @embedFile("shaders/raytrace.wgsl"));
+    app.raytracing_pipeline = app.core.device().createComputePipeline(
+        &gpu.ComputePipeline.Descriptor{
+            .compute = gpu.ProgrammableStageDescriptor{
+                .module = raytracing_module,
+                .entry_point = "main",
+            },
+        },
+    );
+
+    // Voxel grid
+    const voxel_grid = try voxel.createVoxelGrid(gpa.allocator(), app.game_config.voxel_grid_dim);
+    const voxel_grid_bytes = voxel_grid.voxels.items;
+    const voxel_grid_size = voxel_grid_bytes.len * @sizeOf(voxel.Voxel);
+    const voxel_grid_buffer = app.core.device().createBuffer(&gpu.Buffer.Descriptor{
+        .label = "voxel_grid",
+        .usage = .{
+            .storage = true,
+            .copy_dst = true,
+        },
+        .size = voxel_grid_size,
+    });
+    app.core.device().getQueue().writeBuffer(voxel_grid_buffer, 0, voxel_grid_bytes[0..]);
+
+    // Texture
+    const img_size = gpu.Extent3D{
+        .width = app.game_config.screen_width,
+        .height = app.game_config.screen_height,
     };
-    defer window.destroy();
 
-    window.setAttrib(glfw.Window.Attrib.resizable, false);
-    window.setAttrib(glfw.Window.Attrib.floating, true);
+    const texture = app.core.device().createTexture(&.{
+        .size = img_size,
+        .format = .rgba8_unorm,
+        .usage = .{
+            .texture_binding = true,
+            .storage_binding = true,
+            .copy_dst = true,
+        },
+    });
 
-    glfw.makeContextCurrent(window);
+    app.raytracing_data_buffer = app.core.device().createBuffer(&gpu.Buffer.Descriptor{
+        .label = "raytracing_data",
+        .usage = .{
+            .uniform = true,
+            .copy_dst = true,
+        },
+        .size = @sizeOf(RaytracingData),
+    });
 
-    const proc: glfw.GLProc = undefined;
-    try gl.load(proc, glGetProcAddress);
+    // }, .size = @sizeOf(RaytracingData) });
 
-    // Setup debug output
-    gl.enable(gl.DEBUG_OUTPUT);
-    gl.enable(gl.DEBUG_OUTPUT_SYNCHRONOUS);
-    gl.debugMessageCallback(&glDebugOutput, null);
+    // Raytracing bind group
+    app.raytracing_bind_group = app.core.device().createBindGroup(&gpu.BindGroup.Descriptor.init(.{
+        .layout = app.raytracing_pipeline.getBindGroupLayout(0), // group 0
+        .entries = &.{
+            gpu.BindGroup.Entry.buffer(0, voxel_grid_buffer, 0, voxel_grid_size),
+            gpu.BindGroup.Entry.textureView(1, texture.createView(&gpu.TextureView.Descriptor{})),
+            gpu.BindGroup.Entry.buffer(2, app.raytracing_data_buffer, 0, @sizeOf(RaytracingData)),
+        },
+    }));
 
-    const triangleVert = try shader.Shader.fromPath(shader.ShaderType.Vertex, "shaders/triangle.vert");
-    const triangleFrag = try shader.Shader.fromPath(shader.ShaderType.Fragment, "shaders/triangle.frag");
+    // Render pipeline
+    const shader_module = app.core.device().createShaderModuleWGSL("quad.wgsl", @embedFile("shaders/quad.wgsl"));
+    // Fragment state
+    const blend = gpu.BlendState{};
+    const color_target = gpu.ColorTargetState{
+        .format = app.core.descriptor().format,
+        .blend = &blend,
+        .write_mask = gpu.ColorWriteMaskFlags.all,
+    };
+    const fragment = gpu.FragmentState.init(.{
+        .module = shader_module,
+        .entry_point = "frag_main",
+        .targets = &.{color_target},
+    });
+    const pipeline_descriptor = gpu.RenderPipeline.Descriptor{
+        .fragment = &fragment,
+        .vertex = gpu.VertexState{
+            .module = shader_module,
+            .entry_point = "vert_main",
+        },
+    };
 
-    var shaders = [_]shader.Shader{ triangleVert, triangleFrag };
-    const triangleProgram = try shader.ShaderProgram.fromShaders(shaders[0..]);
-    try gpu.addShaderProgram("triangle", triangleProgram);
+    imgui.init(gpa.allocator());
+    imgui.mach_backend.init(&app.core, app.core.device(), app.core.descriptor().format, .{});
 
-    const vertices = [_]f32{ -0.5, -0.5, 0.0, 0.5, -0.5, 0.0, 0.0, 0.5, 0.0 };
-    try gpu.initVertexBuffer("vertex", @sizeOf(@TypeOf(vertices)), &vertices, 3, 0);
+    const font_size = 18.0;
+    const font_normal = imgui.io.addFontFromFile(assets.fonts.roboto_medium.path, font_size);
+    imgui.io.setDefaultFont(font_normal);
 
-    // Creates voxel grid in and voxel grid out
-    try createStorageBuffer();
+    app.render_pipeline = app.core.device().createRenderPipeline(&pipeline_descriptor);
+    app.queue = app.core.device().getQueue();
 
-    // Creates a texture for writing
-    try gpu.initTexture2D("texture out", @as(i32, config.width), @as(i32, config.height));
+    app.render_bind_group = app.core.device().createBindGroup(&gpu.BindGroup.Descriptor.init(.{
+        .layout = app.render_pipeline.getBindGroupLayout(0), // group 0
+        .entries = &.{
+            gpu.BindGroup.Entry.textureView(0, texture.createView(&gpu.TextureView.Descriptor{})),
+        },
+    }));
 
-    const raycastComp = try shader.Shader.fromPath(shader.ShaderType.Compute, "shaders/raytrace.comp");
+    shader_module.release();
+}
 
-    var raytraceShaders = [_]shader.Shader{raycastComp};
-    var raytraceProgram = try shader.ShaderProgram.fromShaders(raytraceShaders[0..]);
-    try gpu.addShaderProgram("raytrace", raytraceProgram);
+pub fn deinit(app: *App) void {
+    defer _ = gpa.deinit();
+    defer app.core.deinit();
 
-    var startTime = glfw.getTime();
-    var lastFrameTime = startTime;
+    imgui.mach_backend.deinit();
+}
 
-    // Wait for the user to close the window.
-    while (!window.shouldClose()) {
-        var nowTime = glfw.getTime();
-        time.time = nowTime - startTime;
-        time.deltaTime += (nowTime - lastFrameTime) / time.limitFPS;
-        lastFrameTime = nowTime;
+pub fn update(app: *App) !bool {
+    app.time.delta_time = app.timer.lap();
+    app.time.time += app.time.delta_time;
 
-        // Have deltaTime accumulate and use a while loop in case the frames dip
-        // heavily below 60 and we need to catch up
-        while (time.deltaTime >= 1.0) {
-            // Perform physics and input handling here
-            try update();
-            stats.updates += 1;
-            time.deltaTime -= 1;
+    var iter = app.core.pollEvents();
+    while (iter.next()) |event| {
+        switch (event) {
+            .close => return true,
+            else => {},
         }
-
-        // render
-        try render();
-        glfw.pollEvents();
-        window.swapBuffers();
+        if (!app.input_data.mouse_captured) {
+            // Don't allow interaction with Imgui widgets while the mouse is captured
+            imgui.mach_backend.passEvent(event);
+        }
+        input.processEvent(app, event);
     }
-}
 
-fn update() !void {
-    processInput();
-}
+    if (app.input_data.pressed_keys.areKeysPressed()) {
+        app.camera.calculateMovement(app.input_data.pressed_keys, app.time.delta_time);
+    }
+    updateRaytracingData(app);
+    updateUniforms(app);
 
-fn render() !void {
-    gl.clearColor(0, 0, 0, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    const back_buffer_view = app.core.swapChain().getCurrentTextureView();
+    const color_attachment = gpu.RenderPassColorAttachment{
+        .view = back_buffer_view,
+        .clear_value = std.mem.zeroes(gpu.Color),
+        .load_op = .clear,
+        .store_op = .store,
+    };
+
+    const encoder = app.core.device().createCommandEncoder(null);
 
     {
-        try gpu.bindStorageBuffer("raytrace", "voxel grid in", 0);
-        try gpu.bindTexture("raytrace", "texture out", 0, 1);
-        gl.dispatchCompute(config.width / 8, config.height / 8, 1);
+        // Raytracing pass
+        const pass = encoder.beginComputePass(null);
+        pass.setPipeline(app.raytracing_pipeline);
+        pass.setBindGroup(0, app.raytracing_bind_group, null);
+        pass.dispatchWorkgroups(app.game_config.screen_width / app.game_config.workgroup_size, app.game_config.screen_width / app.game_config.workgroup_size, 1);
+        pass.end();
+        pass.release();
     }
 
-    gl.memoryBarrier(gl.SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    {
+        // Render pass
+        const render_pass_info = gpu.RenderPassDescriptor.init(.{
+            .color_attachments = &.{color_attachment},
+        });
+        const pass = encoder.beginRenderPass(&render_pass_info);
+        pass.setPipeline(app.render_pipeline);
+        pass.setBindGroup(0, app.render_bind_group, null);
+        pass.draw(6, 1, 0, 0);
 
-    try gpu.bindVertices("triangle");
-    try gpu.bindTexture("triangle", "texture out", 0, 1);
-    try gpu.bindUniform("triangle", "rotation", processRotation());
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
+        // Imgui
+        imgui.mach_backend.newFrame();
+
+        ui.draw(app);
+
+        imgui.mach_backend.draw(pass);
+
+        pass.end();
+        pass.release();
+    }
+
+    var command = encoder.finish(null);
+    encoder.release();
+
+    app.queue.submit(&[_]*gpu.CommandBuffer{command});
+    command.release();
+    app.core.swapChain().present();
+    back_buffer_view.release();
+
+    return false;
 }
 
-fn processInput() void {
-    if (window.getKey(glfw.Key.escape) == glfw.Action.press) {
-        window.setShouldClose(true);
-    }
-
-    if (window.getKey(glfw.Key.left) == glfw.Action.press) {
-        rotation -= 1.0;
-    }
-
-    if (window.getKey(glfw.Key.right) == glfw.Action.press) {
-        rotation += 1.0;
-    }
+fn updateRaytracingData(app: *App) void {
+    app.raytracing_data.dim = app.game_config.voxel_grid_dim;
+    app.raytracing_data.camera_matrix = app.camera.matrices.view;
+    app.raytracing_data.inverse_projection_matrix = app.camera.matrices.perspective;
 }
 
-fn processRotation() [2]f32 {
-    return [2]f32{ 0.5 * std.math.sin(rotation), 0.5 * std.math.cos(rotation) };
+fn updateUniforms(app: *App) void {
+    const bytes = std.mem.toBytes(app.raytracing_data);
+    app.queue.writeBuffer(app.raytracing_data_buffer, 0, bytes[0..]);
 }
 
-const VoxelBufferSize: u32 = 128;
-
-fn createStorageBuffer() !void {
-    const memory = try allocator.alloc(u32, VoxelBufferSize * VoxelBufferSize * VoxelBufferSize);
-    defer allocator.free(memory);
-
-    // create a sphere as an example
-    const n = VoxelBufferSize;
-    const r = (n - 1);
-    var i: u32 = 0;
-    while (i < n) : (i += 1) {
-        var j: u32 = 0;
-        while (j < n) : (j += 1) {
-            var k: u32 = 0;
-            while (k < n) : (k += 1) {
-                const index = (i * n * n) + (j * n) + k;
-                if (i * i + j * j + k * k <= r * r) {
-                    memory[index] = 1;
-                } else {
-                    memory[index] = 0;
-                }
-            }
-        }
-    }
-
-    const voxelGridSize = @sizeOf(u32) * @as(isize, @truncate(u32, memory.len));
-    try gpu.initStorageBuffer("voxel grid in", voxelGridSize, memory.ptr);
-    try gpu.initStorageBuffer("voxel grid out", voxelGridSize, memory.ptr);
+fn setupCamera(app: *App) void {
+    app.camera = Camera{
+        .rotation_speed = 0.5,
+        .movement_speed = 10.0,
+    };
+    const aspect_ratio: f32 = @intToFloat(f32, app.core.descriptor().width) / @intToFloat(f32, app.core.descriptor().height);
+    app.camera.position = .{ -10.0, -6.0, -6.0, 0.0 };
+    app.camera.target = .{ 5.0, 5.0, 5.0, 0.0 };
+    app.camera.setPerspective(60.0, aspect_ratio, 0.1, 256.0);
+    app.camera.updateTarget();
 }
