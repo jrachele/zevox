@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) !void {
         },
     } };
 
-    try ensureDependencies(b.allocator);
+    // try ensureDependencies(b.allocator);
 
     const zmathModule = std.Build.ModuleDependency{
         .name = "zmath",

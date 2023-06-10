@@ -12,11 +12,10 @@ const prelude = @import("prelude.zig");
 
 const Camera = @import("camera.zig").Camera;
 const InputData = input.InputData;
+const ShaderResource = assets.ShaderResource;
 
 const gpu = mach.gpu;
 pub const App = @This();
-
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 
 const GameConfig = struct {
     screen_width: u32 = 1920,
@@ -41,28 +40,38 @@ test "raytracing data size" {
     try std.testing.expect(@sizeOf(RaytracingData) == 144);
 }
 
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+
+allocator: std.mem.Allocator,
 core: mach.Core,
 timer: mach.Timer,
 time: Time,
 game_config: GameConfig,
 input_data: InputData,
 camera: Camera,
+
+// TODO: Refactor shader resources into more intelligent asset pipeline
 raytracing_data: RaytracingData,
 raytracing_data_buffer: *gpu.Buffer,
+raytracing_shader: ShaderResource,
 raytracing_pipeline: *gpu.ComputePipeline,
 raytracing_bind_group: *gpu.BindGroup,
+render_shader: ShaderResource,
 render_pipeline: *gpu.RenderPipeline,
 render_bind_group: *gpu.BindGroup,
+texture: *gpu.Texture,
+voxel_grid_buffer: *gpu.Buffer,
 queue: *gpu.Queue,
 
 pub fn init(app: *App) !void {
+    app.allocator = gpa.allocator();
     app.game_config = GameConfig{};
     app.input_data = InputData{};
     app.setupCamera();
     app.timer = try mach.Timer.start();
     app.time = Time{};
 
-    try app.core.init(gpa.allocator(), .{ .title = "Zoxel", .size = .{
+    try app.core.init(app.allocator, .{ .title = "Zoxel", .size = .{
         .width = app.game_config.screen_width,
         .height = app.game_config.screen_height,
     } });
@@ -71,21 +80,14 @@ pub fn init(app: *App) !void {
     app.core.setVSync(.none);
 
     // Raytracing compute pipeline
-    const raytracing_module = app.core.device().createShaderModuleWGSL("raytrace.wgsl", @embedFile("shaders/raytrace.wgsl"));
-    app.raytracing_pipeline = app.core.device().createComputePipeline(
-        &gpu.ComputePipeline.Descriptor{
-            .compute = gpu.ProgrammableStageDescriptor{
-                .module = raytracing_module,
-                .entry_point = "main",
-            },
-        },
-    );
+    try app.raytracing_shader.init(app.allocator, assets.shaders.raytrace);
 
     // Voxel grid
-    const voxel_grid = try voxel.createVoxelGrid(gpa.allocator(), app.game_config.voxel_grid_dim);
+    const voxel_grid = try voxel.createVoxelGrid(app.allocator, app.game_config.voxel_grid_dim);
+    defer voxel_grid.deinit();
     const voxel_grid_bytes = voxel_grid.voxels.items;
     const voxel_grid_size = voxel_grid_bytes.len * @sizeOf(voxel.Voxel);
-    const voxel_grid_buffer = app.core.device().createBuffer(&gpu.Buffer.Descriptor{
+    app.voxel_grid_buffer = app.core.device().createBuffer(&gpu.Buffer.Descriptor{
         .label = "voxel_grid",
         .usage = .{
             .storage = true,
@@ -93,7 +95,8 @@ pub fn init(app: *App) !void {
         },
         .size = voxel_grid_size,
     });
-    app.core.device().getQueue().writeBuffer(voxel_grid_buffer, 0, voxel_grid_bytes[0..]);
+
+    app.core.device().getQueue().writeBuffer(app.voxel_grid_buffer, 0, voxel_grid_bytes[0..]);
 
     // Texture
     const img_size = gpu.Extent3D{
@@ -101,7 +104,7 @@ pub fn init(app: *App) !void {
         .height = app.game_config.screen_height,
     };
 
-    const texture = app.core.device().createTexture(&.{
+    app.texture = app.core.device().createTexture(&.{
         .size = img_size,
         .format = .rgba8_unorm,
         .usage = .{
@@ -120,20 +123,14 @@ pub fn init(app: *App) !void {
         .size = @sizeOf(RaytracingData),
     });
 
-    // }, .size = @sizeOf(RaytracingData) });
-
-    // Raytracing bind group
-    app.raytracing_bind_group = app.core.device().createBindGroup(&gpu.BindGroup.Descriptor.init(.{
-        .layout = app.raytracing_pipeline.getBindGroupLayout(0), // group 0
-        .entries = &.{
-            gpu.BindGroup.Entry.buffer(0, voxel_grid_buffer, 0, voxel_grid_size),
-            gpu.BindGroup.Entry.textureView(1, texture.createView(&gpu.TextureView.Descriptor{})),
-            gpu.BindGroup.Entry.buffer(2, app.raytracing_data_buffer, 0, @sizeOf(RaytracingData)),
-        },
-    }));
-
     // Render pipeline
-    const shader_module = app.core.device().createShaderModuleWGSL("quad.wgsl", @embedFile("shaders/quad.wgsl"));
+    try app.render_shader.init(app.allocator, assets.shaders.quad);
+    const shader_module = app.core.device().createShaderModuleWGSL(
+        assets.shaders.quad,
+        app.render_shader.data(),
+    );
+    defer shader_module.release();
+
     // Fragment state
     const blend = gpu.BlendState{};
     const color_target = gpu.ColorTargetState{
@@ -154,7 +151,7 @@ pub fn init(app: *App) !void {
         },
     };
 
-    imgui.init(gpa.allocator());
+    imgui.init(app.allocator);
     imgui.mach_backend.init(&app.core, app.core.device(), app.core.descriptor().format, .{});
 
     const font_size = 18.0;
@@ -167,18 +164,20 @@ pub fn init(app: *App) !void {
     app.render_bind_group = app.core.device().createBindGroup(&gpu.BindGroup.Descriptor.init(.{
         .layout = app.render_pipeline.getBindGroupLayout(0), // group 0
         .entries = &.{
-            gpu.BindGroup.Entry.textureView(0, texture.createView(&gpu.TextureView.Descriptor{})),
+            gpu.BindGroup.Entry.textureView(0, app.texture.createView(&gpu.TextureView.Descriptor{})),
         },
     }));
-
-    shader_module.release();
 }
 
 pub fn deinit(app: *App) void {
     defer _ = gpa.deinit();
     defer app.core.deinit();
 
+    app.raytracing_shader.deinit();
+    app.render_shader.deinit();
+
     imgui.mach_backend.deinit();
+    imgui.deinit();
 }
 
 pub fn update(app: *App) !bool {
@@ -201,6 +200,8 @@ pub fn update(app: *App) !bool {
     if (app.input_data.pressed_keys.areKeysPressed()) {
         app.camera.calculateMovement(app.input_data.pressed_keys, app.time.delta_time);
     }
+
+    try updateShaders(app);
     updateRaytracingData(app);
     updateUniforms(app);
 
@@ -219,7 +220,7 @@ pub fn update(app: *App) !bool {
         const pass = encoder.beginComputePass(null);
         pass.setPipeline(app.raytracing_pipeline);
         pass.setBindGroup(0, app.raytracing_bind_group, null);
-        pass.dispatchWorkgroups(app.game_config.screen_width / app.game_config.workgroup_size, app.game_config.screen_width / app.game_config.workgroup_size, 1);
+        pass.dispatchWorkgroups(app.game_config.screen_width / app.game_config.workgroup_size, app.game_config.screen_height / app.game_config.workgroup_size, 1);
         pass.end();
         pass.release();
     }
@@ -256,10 +257,52 @@ pub fn update(app: *App) !bool {
     return false;
 }
 
+//////////////////////////////////////////////////////////////////////////////////////
+// Internal
+//////////////////////////////////////////////////////////////////////////////////////
+
+fn createRaytracingPipeline(app: *App) !void {
+    const raytracing_module = app.core.device().createShaderModuleWGSL(
+        assets.shaders.raytrace,
+        app.raytracing_shader.data(),
+    );
+
+    defer raytracing_module.release();
+
+    app.raytracing_pipeline = app.core.device().createComputePipeline(
+        &gpu.ComputePipeline.Descriptor{
+            .compute = gpu.ProgrammableStageDescriptor{
+                .module = raytracing_module,
+                .entry_point = "main",
+            },
+        },
+    );
+
+    // Raytracing bind group
+    app.raytracing_bind_group = app.core.device().createBindGroup(&gpu.BindGroup.Descriptor.init(.{
+        .layout = app.raytracing_pipeline.getBindGroupLayout(0), // group 0
+        .entries = &.{
+            gpu.BindGroup.Entry.buffer(0, app.voxel_grid_buffer, 0, app.voxel_grid_buffer.getSize()),
+            gpu.BindGroup.Entry.textureView(1, app.texture.createView(&gpu.TextureView.Descriptor{})),
+            gpu.BindGroup.Entry.buffer(2, app.raytracing_data_buffer, 0, @sizeOf(RaytracingData)),
+        },
+    }));
+}
+
 fn updateRaytracingData(app: *App) void {
     app.raytracing_data.dim = app.game_config.voxel_grid_dim;
     app.raytracing_data.camera_matrix = app.camera.matrices.view;
     app.raytracing_data.inverse_projection_matrix = app.camera.matrices.perspective;
+}
+
+fn updateShaders(app: *App) !void {
+    try app.raytracing_shader.update();
+    try app.render_shader.update();
+
+    if (app.raytracing_shader.dirty) {
+        try createRaytracingPipeline(app);
+        app.raytracing_shader.dirty = false;
+    }
 }
 
 fn updateUniforms(app: *App) void {
@@ -274,7 +317,7 @@ fn setupCamera(app: *App) void {
     };
     const aspect_ratio: f32 = @intToFloat(f32, app.core.descriptor().width) / @intToFloat(f32, app.core.descriptor().height);
     app.camera.position = .{ -10.0, -6.0, -6.0, 0.0 };
-    app.camera.target = .{ 5.0, 5.0, 5.0, 0.0 };
-    app.camera.setPerspective(60.0, aspect_ratio, 0.1, 256.0);
+    app.camera.target = .{ 5.0, 5.0, -5.0, 0.0 };
+    app.camera.setPerspective(90.0, aspect_ratio, 0.1, 1000.0);
     app.camera.updateTarget();
 }

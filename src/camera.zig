@@ -24,6 +24,7 @@ pub const Camera = struct {
     target: Vec4 = .{ 0.0, 0.0, 0.0, 1.0 },
     position: Vec4 = .{ 0.0, 0.0, 0.0, 0.0 },
 
+    aspect: f32 = 0.0,
     fov: f32 = 0.0,
     znear: f32 = 0.0,
     zfar: f32 = 0.0,
@@ -85,12 +86,18 @@ pub const Camera = struct {
         self.matrices.view = zmath.matToArr(zmath.inverse(zmath.lookAtRh(self.position, focusPos, [4]f32{ 0.0, 1.0, 0.0, 0.0 })));
     }
 
+    pub fn updatePerspectiveMatrix(self: *@This()) void {
+        const perspective = zmath.inverse(zmath.perspectiveFovRhGl(math.degreesToRadians(f32, self.fov), self.aspect, self.znear, self.zfar));
+        self.matrices.perspective = zmath.matToArr(perspective);
+    }
+
     pub fn setPerspective(self: *@This(), fov: f32, aspect: f32, znear: f32, zfar: f32) void {
         self.fov = fov;
         self.znear = znear;
         self.zfar = zfar;
-        const perspective = zmath.inverse(zmath.perspectiveFovRhGl(math.degreesToRadians(f32, fov), aspect, znear, zfar));
-        self.matrices.perspective = zmath.matToArr(perspective);
+        self.aspect = aspect;
+
+        self.updatePerspectiveMatrix();
     }
 
     pub fn rotate(self: *@This(), delta: Vec2) void {
