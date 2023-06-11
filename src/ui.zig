@@ -20,6 +20,7 @@ pub fn draw(app: *App) void {
         const forward = app.camera.target;
         imgui.text("pos x: {d:.3} y: {d:.3} z: {d:.3}", .{ position[0], position[1], position[2] });
         imgui.text("fwd x: {d:.3} y: {d:.3} z: {d:.3}", .{ forward[0], forward[1], forward[2] });
+        imgui.text("pitch: {d:.3}, yaw: {d:.3}", .{ app.camera.pitch, app.camera.yaw });
 
         _ = imgui.sliderFloat("Move speed", .{
             .v = &app.camera.movement_speed,

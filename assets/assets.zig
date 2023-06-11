@@ -11,6 +11,7 @@ pub const fonts = struct {
 pub const shaders = struct {
     pub const quad = root_path ++ "shaders/quad.wgsl";
     pub const raytrace = root_path ++ "shaders/raytrace.wgsl";
+    pub const physics = root_path ++ "shaders/physics.wgsl";
 };
 
 pub const ShaderResource = struct {

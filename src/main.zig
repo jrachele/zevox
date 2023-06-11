@@ -21,7 +21,8 @@ const GameConfig = struct {
     screen_width: u32 = 1920,
     screen_height: u32 = 1080,
     voxel_grid_dim: u32 = 256,
-    workgroup_size: u32 = 8,
+    physics_workgroups: u32 = 4,
+    raytracing_workgroups: u32 = 8,
 };
 
 const Time = struct {
@@ -45,22 +46,35 @@ var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 allocator: std.mem.Allocator,
 core: mach.Core,
 timer: mach.Timer,
+physics_timer: mach.Timer,
 time: Time,
 game_config: GameConfig,
 input_data: InputData,
 camera: Camera,
 
 // TODO: Refactor shader resources into more intelligent asset pipeline
+
+// Physics
+physics_shader: ShaderResource,
+physics_pipeline: *gpu.ComputePipeline,
+physics_bind_group: *gpu.BindGroup,
+
+// Raytracing
 raytracing_data: RaytracingData,
 raytracing_data_buffer: *gpu.Buffer,
 raytracing_shader: ShaderResource,
 raytracing_pipeline: *gpu.ComputePipeline,
 raytracing_bind_group: *gpu.BindGroup,
+
+// Fullscreen quad
 render_shader: ShaderResource,
 render_pipeline: *gpu.RenderPipeline,
 render_bind_group: *gpu.BindGroup,
+
+// Shared buffers
 texture: *gpu.Texture,
 voxel_grid_buffer: *gpu.Buffer,
+voxel_grid_backbuffer: *gpu.Buffer,
 queue: *gpu.Queue,
 
 pub fn init(app: *App) !void {
@@ -69,6 +83,7 @@ pub fn init(app: *App) !void {
     app.input_data = InputData{};
     app.setupCamera();
     app.timer = try mach.Timer.start();
+    app.physics_timer = try mach.Timer.start();
     app.time = Time{};
 
     try app.core.init(app.allocator, .{ .title = "Zoxel", .size = .{
@@ -78,6 +93,9 @@ pub fn init(app: *App) !void {
 
     // Disable VSync cause I ain't no RAT.
     app.core.setVSync(.none);
+
+    // Physics compute pipeline
+    try app.physics_shader.init(app.allocator, assets.shaders.physics);
 
     // Raytracing compute pipeline
     try app.raytracing_shader.init(app.allocator, assets.shaders.raytrace);
@@ -91,12 +109,23 @@ pub fn init(app: *App) !void {
         .label = "voxel_grid",
         .usage = .{
             .storage = true,
+            .copy_src = true,
+            .copy_dst = true,
+        },
+        .size = voxel_grid_size,
+    });
+    app.voxel_grid_backbuffer = app.core.device().createBuffer(&gpu.Buffer.Descriptor{
+        .label = "voxel_grid_back",
+        .usage = .{
+            .storage = true,
+            .copy_src = true,
             .copy_dst = true,
         },
         .size = voxel_grid_size,
     });
 
     app.core.device().getQueue().writeBuffer(app.voxel_grid_buffer, 0, voxel_grid_bytes[0..]);
+    app.core.device().getQueue().writeBuffer(app.voxel_grid_backbuffer, 0, voxel_grid_bytes[0..]);
 
     // Texture
     const img_size = gpu.Extent3D{
@@ -215,12 +244,28 @@ pub fn update(app: *App) !bool {
 
     const encoder = app.core.device().createCommandEncoder(null);
 
+    if (app.physics_timer.read() >= 1.0 / 60.0) {
+        // Physics pass
+        const pass = encoder.beginComputePass(null);
+        pass.setPipeline(app.physics_pipeline);
+        pass.setBindGroup(0, app.physics_bind_group, null);
+        pass.dispatchWorkgroups(app.game_config.voxel_grid_dim / app.game_config.physics_workgroups, app.game_config.voxel_grid_dim / app.game_config.physics_workgroups, app.game_config.voxel_grid_dim / app.game_config.physics_workgroups);
+
+        pass.end();
+        pass.release();
+
+        app.physics_timer.reset();
+    }
+
+    // Copy the backbuffer over for the render pass
+    encoder.copyBufferToBuffer(app.voxel_grid_backbuffer, 0, app.voxel_grid_buffer, 0, app.voxel_grid_buffer.getSize());
+
     {
         // Raytracing pass
         const pass = encoder.beginComputePass(null);
         pass.setPipeline(app.raytracing_pipeline);
         pass.setBindGroup(0, app.raytracing_bind_group, null);
-        pass.dispatchWorkgroups(app.game_config.screen_width / app.game_config.workgroup_size, app.game_config.screen_height / app.game_config.workgroup_size, 1);
+        pass.dispatchWorkgroups(app.game_config.screen_width / app.game_config.raytracing_workgroups, app.game_config.screen_height / app.game_config.raytracing_workgroups, 1);
         pass.end();
         pass.release();
     }
@@ -261,6 +306,34 @@ pub fn update(app: *App) !bool {
 // Internal
 //////////////////////////////////////////////////////////////////////////////////////
 
+fn createPhysicsPipeline(app: *App) !void {
+    const physics_module = app.core.device().createShaderModuleWGSL(
+        assets.shaders.physics,
+        app.physics_shader.data(),
+    );
+
+    defer physics_module.release();
+
+    app.physics_pipeline = app.core.device().createComputePipeline(
+        &gpu.ComputePipeline.Descriptor{
+            .compute = gpu.ProgrammableStageDescriptor{
+                .module = physics_module,
+                .entry_point = "main",
+            },
+        },
+    );
+
+    // physics bind group
+    app.physics_bind_group = app.core.device().createBindGroup(&gpu.BindGroup.Descriptor.init(.{
+        .layout = app.physics_pipeline.getBindGroupLayout(0), // group 0
+        .entries = &.{
+            gpu.BindGroup.Entry.buffer(0, app.voxel_grid_buffer, 0, app.voxel_grid_buffer.getSize()),
+            gpu.BindGroup.Entry.buffer(1, app.voxel_grid_backbuffer, 0, app.voxel_grid_backbuffer.getSize()),
+            gpu.BindGroup.Entry.buffer(2, app.raytracing_data_buffer, 0, @sizeOf(RaytracingData)),
+        },
+    }));
+}
+
 fn createRaytracingPipeline(app: *App) !void {
     const raytracing_module = app.core.device().createShaderModuleWGSL(
         assets.shaders.raytrace,
@@ -296,8 +369,14 @@ fn updateRaytracingData(app: *App) void {
 }
 
 fn updateShaders(app: *App) !void {
+    try app.physics_shader.update();
     try app.raytracing_shader.update();
     try app.render_shader.update();
+
+    if (app.physics_shader.dirty) {
+        try createPhysicsPipeline(app);
+        app.physics_shader.dirty = false;
+    }
 
     if (app.raytracing_shader.dirty) {
         try createRaytracingPipeline(app);
@@ -316,8 +395,9 @@ fn setupCamera(app: *App) void {
         .movement_speed = 10.0,
     };
     const aspect_ratio: f32 = @intToFloat(f32, app.core.descriptor().width) / @intToFloat(f32, app.core.descriptor().height);
-    app.camera.position = .{ -10.0, -6.0, -6.0, 0.0 };
-    app.camera.target = .{ 5.0, 5.0, -5.0, 0.0 };
+    app.camera.position = .{ -10.0, 5.0, -5.0, 0.0 };
+    app.camera.pitch = 0.0;
+    app.camera.yaw = -130.0;
     app.camera.setPerspective(90.0, aspect_ratio, 0.1, 1000.0);
     app.camera.updateTarget();
 }

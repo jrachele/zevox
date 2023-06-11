@@ -87,7 +87,7 @@ pub const Camera = struct {
     }
 
     pub fn updatePerspectiveMatrix(self: *@This()) void {
-        const perspective = zmath.inverse(zmath.perspectiveFovRhGl(math.degreesToRadians(f32, self.fov), self.aspect, self.znear, self.zfar));
+        const perspective = zmath.inverse(zmath.perspectiveFovRh(math.degreesToRadians(f32, self.fov), self.aspect, self.znear, self.zfar));
         self.matrices.perspective = zmath.matToArr(perspective);
     }
 
